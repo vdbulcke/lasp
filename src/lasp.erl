@@ -47,6 +47,10 @@
          wait_needed/2,
          thread/3]).
 
+%% @project transaction feature
+%% transaction API
+-export([transaction/2]).
+
 -export([invariant/3,
          enforce_once/3]).
 
@@ -127,6 +131,15 @@ declare(Id, Type) ->
 -spec update(id(), operation(), actor()) -> {ok, var()} | {error, timeout}.
 update(Id, Operation, Actor) ->
     do(update, [Id, Operation, Actor]).
+
+%% transaction feature project
+%%      Transaction:  a list of {Id, Operation} tuple
+%%      Actor: an Actor
+%% TODO add spec
+%% @question
+transaction(Transaction, Actor)->
+  do(transaction, [Transaction, Actor]).
+
 
 %% @doc Bind a dataflow variable to a value.
 %%

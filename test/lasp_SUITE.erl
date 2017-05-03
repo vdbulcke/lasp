@@ -683,10 +683,56 @@ monotonic_read_test(_Config) ->
 
     ok.
 
+
+%% @project transaction feature
+%% testing transaction
+transaction_test(Config) ->
+  % match the two first elemnts of the list
+  [Node1, _Node2, Node3 | _Nodes] = proplists:get_value(nodes, Config),
+
+  % RPC declare Set
+  % TODO return value is it ok ??
+  {ok, {S1, _, _, _}} = rpc:call(Node1, lasp, declare, [?SET]),
+  {ok, {S2, _, _, _}} = rpc:call(Node1, lasp, declare, [?SET]),
+
+  % perform transaction on node1 to setup some value on
+  Transaction = [ {S1, {add, 42} } , {S2, {add, 24} } ],
+  _ = rpc:call(Node1, lasp, transaction, [ Transaction , self() ]),
+
+  %% Sleep. Waiting for transaction to be sent to Node2
+  timer:sleep(8000),
+  timer:sleep(8000),
+
+  Transaction2 = [ {S1, {rmv, 42} } ,  {S1, {add, 41} }, {S2, {rmv, 24} },   {S2, {add, 25} } ],
+  _ = rpc:call(Node1, lasp, transaction, [ Transaction2 , self() ]),
+
+  %% read S1 on Node2
+  {ok, S1N2} = rpc:call(Node3, lasp, query, [S1]),
+
+
+  %% Sleep. Waiting for transaction to be sent to Node2
+
+  timer:sleep(8000),
+  timer:sleep(8000),
+
+  {ok, S1N2T} = rpc:call(Node3, lasp, query, [S1]),
+  {ok, S2N2T} = rpc:call(Node3, lasp, query, [S2]),
+
+
+  ?assertEqual( [42], sets:to_list(S1N2) ),
+  ?assertEqual( [41], sets:to_list( S1N2T) ),
+  ?assertEqual( [25], sets:to_list( S2N2T) ),
+
+
+  ok.
+
 %% @doc Dynamic variable test.
 dynamic_ivar_test(Config) ->
+  % match the two first elemnts of the list
     [Node1, Node2 | _Nodes] = proplists:get_value(nodes, Config),
 
+
+    % use RPC to remotely run functions on nodes
     %% Setup a dynamic variable.
     {ok, {Id, _, _, Value}} = rpc:call(Node1, lasp, declare_dynamic,
                                        [?ID, ivar]),

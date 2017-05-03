@@ -49,8 +49,8 @@ peer-to-peer-ad-counter-simulation:
 client-server-ad-counter-simulation:
 	${REBAR} ct --suite=lasp_client_server_advertisement_counter_SUITE
 
-ad-counter-overcounting:
-	#${REBAR} ct --suite=lasp_advertisement_counter_overcounting_SUITE
+# ad-counter-overcounting:
+# 	${REBAR} ct --suite=lasp_advertisement_counter_overcounting_SUITE
 
 ad-counter-partition-overcounting:
 	${REBAR} ct --suite=lasp_advertisement_counter_partition_overcounting_SUITE

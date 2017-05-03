@@ -37,6 +37,10 @@
 
 -export([blocking_sync/1]).
 
+%% @project transaction feature
+%% transaction function API
+-export([enable_transaction/0,new_transaction/2]).
+
 %% lasp_synchronization_backend callbacks
 -export([extract_log_type_and_payload/1]).
 
@@ -46,7 +50,11 @@
 -record(state, {store :: store(),
                 gossip_peers :: [],
                 actor :: binary(),
-                blocking_syncs :: dict:dict()}).
+                current_transaction_id ,
+                last_done_transaction_id :: dict:dict(),
+                blocking_syncs :: dict:dict(),
+                pending_transaction :: dict:dict() %% @project transaction feature
+                }).
 
 %%%===================================================================
 %%% lasp_synchronization_backend callbacks
@@ -56,7 +64,15 @@
 extract_log_type_and_payload({state_ack, _From, _Id, {_Id, _Type, _Metadata, State}}) ->
     [{state_ack, State}];
 extract_log_type_and_payload({state_send, _Node, {Id, Type, _Metadata, State}, _AckRequired}) ->
-    [{Id, State}, {Type, State}, {state_send, State}, {state_send_protocol, Id}].
+    [{Id, State}, {Type, State}, {state_send, State}, {state_send_protocol, Id}];
+
+%% TODO figure out what this extract_log_type_and_payload does, and what
+%%      should be the output for transaction_send transaction_ack msg
+extract_log_type_and_payload({transaction_ack, From, Transactions})->
+  [{transaction_ack, From, Transactions}];
+
+extract_log_type_and_payload({transaction_send, From, Transactions })->
+  [{transaction_send, From, Transactions }].
 
 %%%===================================================================
 %%% API
@@ -70,6 +86,17 @@ start_link(Opts) ->
 blocking_sync(ObjectFilterFun) ->
     gen_server:call(?MODULE, {blocking_sync, ObjectFilterFun}, infinity).
 
+%% @project transaction feature
+%% will enable the transaction feature
+%% TODO need to be exported (part of API)
+enable_transaction() ->
+    gen_server:call(?MODULE, {enable_transaction}, infinity).
+
+%% @project transaction feature
+%% NEW API function
+new_transaction(Transaction, Actor)->
+  gen_server:call(?MODULE, {transaction, Transaction, Actor}, infinity).
+
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
@@ -80,27 +107,37 @@ init([Store, Actor]) ->
     %% Seed the process at initialization.
     ?SYNC_BACKEND:seed(),
 
+    %% TODO disable the schedule_state_synchronization here
     %% Schedule periodic state synchronization.
-    case lasp_config:get(blocking_sync, false) of
-        true ->
-            case partisan_config:get(tag, undefined) of
-                server ->
-                    schedule_state_synchronization();
-                _ ->
-                    ok
-            end;
-        false ->
-            schedule_state_synchronization()
-    end,
+    % case lasp_config:get(blocking_sync, false) of
+    %     true ->
+    %         case partisan_config:get(tag, undefined) of
+    %             server ->
+    %                 schedule_state_synchronization();
+    %             _ ->
+    %                 ok
+    %         end;
+    %     false ->
+    %         schedule_state_synchronization()
+    % end,
+
 
     %% Schedule periodic plumtree refresh.
     schedule_plumtree_peer_refresh(),
 
     BlockingSyncs = dict:new(),
+    PendingTrans  = dict:new(), % @project buffer of pending transaction
+
+    % @project start transaction schedule instead of schedule_state_synchronization()
+    schedule_transaction_sync(),
+
 
     {ok, #state{gossip_peers=[],
                 blocking_syncs=BlockingSyncs,
                 store=Store,
+                pending_transaction=PendingTrans,
+                current_transaction_id=0,
+                last_done_transaction_id=dict:new(),
                 actor=Actor}}.
 
 %% @private
@@ -142,6 +179,32 @@ handle_call({blocking_sync, ObjectFilterFun}, From,
             {reply, ok, State}
     end;
 
+%% @project transaction feature
+%% handler
+%% For each Peers, append the transaction in the pending_transaction
+%% Buffer
+handle_call({transaction, Transaction, CRDTActor},  _From,
+              #state{pending_transaction=PendingTrans,
+              current_transaction_id=Tid,
+              gossip_peers=GossipPeers}=State ) ->
+
+
+  NewPending = update_pending(PendingTrans, GossipPeers),
+   % For each peer, add the current transaction to the buffer
+   % of pending transaction
+   AddPending = dict:fold(fun(K,V,Acc)->
+                    % add CurrTrans into buffer of pending transaction
+                    % and update Transaction id
+                    Trans = lists:append([{Transaction,CRDTActor, Tid + 1}], V),
+                    % store the Buffer for this peer
+                    dict:store(K, Trans, Acc)
+                  end,dict:new(),NewPending),
+    %
+    % Update State with new set of pending_transaction
+    {reply, ok, State#state{pending_transaction=AddPending, current_transaction_id=Tid+1}};
+
+
+
 handle_call(Msg, _From, State) ->
     _ = lager:warning("Unhandled messages: ~p", [Msg]),
     {reply, ok, State}.
@@ -172,6 +235,66 @@ handle_cast({state_ack, From, Id, {Id, _Type, _Metadata, Value}},
                 end
               end, dict:new(), BlockingSyncs0),
     {noreply, State#state{blocking_syncs=BlockingSyncs}};
+
+%% @project transaction feature
+%% param:
+%%   From:  node that sent the ack
+%%   Transactions: Buffer of pending_transaction
+%%                 [{Transaction,CRDTActor},..]
+%% Clear the set of Transaction in Transactions, from
+%% the pending_transaction for the peer From
+handle_cast({transaction_ack, From, Transactions},
+            #state{store=_,
+                  pending_transaction=PendingTrans0}=State) ->
+  %
+  PendingTrans = lists:foldl(fun(Trans,Acc)->
+                    % get current Buffer of pending_transaction for node From
+                    Buffer = dict:fetch(From,Acc),
+                    % remove current transaction from Buffer
+                    NewBuf = lists:delete(Trans, Buffer),
+                    % update PendingTrans
+                    dict:store(From,NewBuf,Acc)
+                  end,PendingTrans0,Transactions),
+  %
+  % Update State with new set of pending_transaction
+  {noreply, State#state{pending_transaction=PendingTrans}};
+
+%% TODO should I consider the case of empty Transactions
+%%       schedule [] ??
+% handle_cast({transaction_send, _From, [] },
+%             #state{store=_, actor=_}=State) ->
+%   % do nothing when receiving empty buffer
+%   {noreply, State};
+
+%% @project transaction feature
+%% param:
+%%   From: node that sent the transaction_send message
+%%   Transactions: Buffer of pending_transaction
+%%                 [{Transaction,CRDTActor},..]
+%% Process received transaction
+%% Send back the transaction_ack
+handle_cast({transaction_send, From, Transactions },
+            #state{store=Store,last_done_transaction_id=Last_id,
+            gossip_peers=GossipPeers,
+             actor=Actor}=State) ->
+  % Updae  Last id dictionary
+  Last = update_last_id(Last_id,GossipPeers),
+  %% get Last_id_node for this node (From)
+  Last_id_node = dict:fetch(From, Last),
+  % call process the transactions schedule received
+  New_LastID_Node = process_transaction_shedule(Transactions,Store, Actor,State,Last_id_node),
+
+  %%
+  New_LastID = dict:store(From,New_LastID_Node,Last),
+
+  % Acknowledge the transactions schedule recived
+  ?SYNC_BACKEND:send(?MODULE, {transaction_ack, node(), Transactions}, From),
+
+  {noreply, State#state{last_done_transaction_id=New_LastID}};
+
+
+
+
 
 handle_cast({state_send, From, {Id, Type, _Metadata, Value}, AckRequired},
             #state{store=Store, actor=Actor}=State) ->
@@ -251,6 +374,44 @@ handle_info({state_sync, ObjectFilterFun},
 
     {noreply, State};
 
+%% @project transaction feature
+%% when receiving a transaction_sync msg,
+%% will send for each peer the corresponding buffer of
+%% pending transaction
+handle_info({transaction_sync},
+            #state{store=_,pending_transaction=PendingTrans,
+            gossip_peers=GossipPeers} = State) ->
+  %
+  % updating the list of pending transaction, might be that
+  % new nodes arrived
+  NewPending = update_pending(PendingTrans, GossipPeers),
+  % TODO @question couldn't it be done with a dict:fold ??
+  % get keys, and for each key send complete buffer
+  % of pending_transaction
+  Keys = dict:fetch_keys(NewPending),
+  SendBufferFct = fun(Key) ->
+    Buffer = dict:fetch(Key,NewPending),
+    case Buffer of
+      [] ->
+        ok;
+      List ->
+        % Sending transaction_send msg
+        ?SYNC_BACKEND:send(?MODULE, {transaction_send, node(), List}, Key)
+    end
+  end,
+
+  lists:foreach(SendBufferFct,Keys),
+
+  % restart schedule
+  schedule_transaction_sync(),
+
+  {noreply, State#state{pending_transaction=NewPending}};
+
+handle_info({enable_transaction}, State) ->
+  gen_server:call(?MODULE, {enable_transaction}, infinity),
+  {noreply, State};
+
+
 handle_info(plumtree_peer_refresh, State) ->
     %% TODO: Temporary hack until the Plumtree can propagate tree
     %% information in the metadata messages.  Therefore, manually poll
@@ -288,6 +449,152 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+
+%% @project transaction feature
+%% update pending Transaction according to Members
+%% If new nodes arrive in the system, this will
+%% add a new buffer for this new nodes
+update_pending(PendingTrans0,GossipPeers) ->
+  % get peers
+  Members = case ?SYNC_BACKEND:broadcast_tree_mode() of
+      true ->
+          GossipPeers;
+      false ->
+          {ok, Members1} = ?SYNC_BACKEND:membership(),
+          Members1
+  end,
+
+  %% Remove ourself and compute exchange peers.
+  Peers = ?SYNC_BACKEND:compute_exchange(?SYNC_BACKEND:without_me(Members)),
+
+  % Build buffer per Peer
+  PendingTrans = lists:foldl(fun(E,Acc) ->
+                          case dict:is_key(E,Acc) of
+                            true ->
+                              Acc;
+                            false ->
+                              dict:store(E,[],Acc)
+                          end
+                      end,PendingTrans0,Peers),
+  %
+  PendingTrans.
+
+
+%% @project transaction feature
+%% last_done_transaction_id according to Members
+%% If new nodes arrive in the system, this will
+%% add a new buffer for this new nodes
+update_last_id(Lastdone,GossipPeers) ->
+  % get peers
+  Members = case ?SYNC_BACKEND:broadcast_tree_mode() of
+      true ->
+          GossipPeers;
+      false ->
+          {ok, Members1} = ?SYNC_BACKEND:membership(),
+          Members1
+  end,
+
+  %% Remove ourself and compute exchange peers.
+  Peers = ?SYNC_BACKEND:compute_exchange(?SYNC_BACKEND:without_me(Members)),
+
+  % Build buffer per Peer
+  Last = lists:foldl(fun(E,Acc) ->
+                          case dict:is_key(E,Acc) of
+                            true ->
+                              Acc;
+                            false ->
+                              dict:store(E,0,Acc)
+                          end
+                      end,Lastdone,Peers),
+  %
+  Last.
+
+
+%% @project transaction feature
+%% process a transaction schedule :Transactions
+%%  as [{Transaction,CRDTActor},..]
+%% received from another node
+process_transaction_shedule(Transactions,Store, Actor,State,Last_id) ->
+  % for each Tranction in the schedule,
+  % call process_single_transaction
+  SingleTransactionFct = fun(Trans) ->
+    case Last_id >= element(3,Trans) of
+      true ->
+        %% if the id of the current Trans is smaller or
+        %% equal than the ID of the last processed transaction
+        %% just ignored this transaction
+        ok;
+      false ->
+        %% this is a new transaction not yet seen
+        process_single_transaction(Trans,Actor,Store,State)
+    end
+  end,
+  %
+  lists:foreach(SingleTransactionFct, Transactions),
+  %% get the last transaction
+  LastT = lists:last(Transactions),
+  %% return the ID of the last Transaction
+  element(3, LastT).
+
+
+%% @project transaction feature
+%% process a single transaction, by applying in order,
+%% the operation for the corresponding id
+%% calling transaction_update function from distribution_backend
+%% cf this function to understand what it does
+process_single_transaction(Transaction,Actor,Store,State) ->
+  % get CRDTActor from transaction
+  CRDTActor = element(2,Transaction),
+  Operations = element(1,Transaction),
+  %% @question For some reason cannot directly access distribution_backend
+  %%           with lasp_distribution_backend:transaction_update
+  Backend = lasp_config:get(distribution_backend,
+                            lasp_distribution_backend),
+  _ = Backend:transaction_update(Operations, CRDTActor, Store, Actor,State, []).
+
+
+
+%% @project transaction feature
+%% periodically send the content of pending_transaction Buffers
+schedule_transaction_sync()->
+  % TODO add parameter ShouldSync like
+  %      in schedule_state_synchronization ??
+  ShouldSync = true
+          andalso (not ?SYNC_BACKEND:tutorial_mode())
+          andalso (
+            ?SYNC_BACKEND:peer_to_peer_mode()
+            orelse
+            (
+             ?SYNC_BACKEND:client_server_mode()
+             andalso
+             not (?SYNC_BACKEND:i_am_server() andalso ?SYNC_BACKEND:reactive_server())
+            )
+          ),
+  %
+  % TODO @question should it have jitter and stuff ??
+  case ShouldSync of
+      true ->
+          Interval = lasp_config:get(state_interval, 10000),
+          case lasp_config:get(jitter, false) of
+              true ->
+                  %% Add random jitter.
+                  MinimalInterval = round(Interval * 0.10),
+
+                  case MinimalInterval of
+                      0 ->
+                          %% No jitter.
+                          timer:send_after(Interval, {transaction_sync});
+                      JitterInterval ->
+                          Jitter = rand_compat:uniform(JitterInterval * 2) - JitterInterval,
+                          timer:send_after(Interval + Jitter, {transaction_sync})
+                  end;
+              false ->
+                  timer:send_after(Interval, {transaction_sync})
+          end;
+      false ->
+          ok
+  end.
+
 
 %% @private
 schedule_state_synchronization() ->

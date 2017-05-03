@@ -50,6 +50,10 @@
          thread/3,
          enforce_once/3]).
 
+%% @project transaction feature
+%% transaction API
+-export([transaction/2, transaction_update/6]).
+
 %% gen_server callbacks
 -export([init/1,
          handle_call/3,
@@ -121,6 +125,18 @@ query(Id) ->
 -spec update(id(), operation(), actor()) -> {ok, var()} | error().
 update(Id, Operation, Actor) ->
     gen_server:call(?MODULE, {update, Id, Operation, Actor}, infinity).
+
+
+
+%% transaction feature project
+%%      IDS: a list of ID
+%%      Operations: a list of Operation (one for each ID)
+%%      Actor: an Actor
+%% TODO add spec
+transaction(Transaction, Actor)->
+  gen_server:call(?MODULE, {transaction,Transaction, Actor}, infinity).
+
+
 
 %% @doc Bind a dataflow variable to a value.
 %%
@@ -469,6 +485,22 @@ handle_call({update, Id, Operation, CRDTActor}, _From,
 
     {reply, Result, State};
 
+%% @project transaction feature
+%% will process the transaction by calling the transaction_update function
+%% then call the lasp_state_based_synchronization_backend transaction
+%% handler
+handle_call({transaction,Transaction, CRDTActor}, _From,
+            #state{store=Store, actor=Actor}=State) ->
+  %
+
+  % performs the update for each tuple {ID,Operation} of the transaction
+  Result = transaction_update(Transaction, CRDTActor, Store, Actor,State, []),
+
+  % transaction_sync handler function
+  _ = lasp_state_based_synchronization_backend:new_transaction(Transaction, Actor),
+  {reply, Result, State};
+
+
 handle_call({enforce_once, Id, Threshold, EnforceFun},
             _From,
             #state{store=Store}=State) ->
@@ -587,6 +619,58 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+
+
+%% @project transaction feature
+%% for each {ID,Operation} tuple of the transaction,
+%% perform the update (same code as for the update function)
+transaction_update([], _, _, _,_,Acc) ->
+    Acc;
+transaction_update([H|T], CRDTActor, Store, Actor,State, Acc) ->
+  case H of
+    {Id, Operation} ->
+    Result = case lasp_config:get(intermediary_node_modification,
+                                  ?INTERMEDIARY_NODE_MODIFICATION) of
+        true ->
+            Result0 = ?CORE:update(Id, Operation, CRDTActor, ?CLOCK_INCR(Actor),
+                                   ?CLOCK_INIT(Actor), Store),
+            Final = {ok, {_, _, Metadata, _}} = declare_if_not_found(Result0, Id, State, ?CORE, update,
+                                 [Id, Operation, Actor, ?CLOCK_INCR(Actor), Store]),
+            case lasp_config:get(blocking_sync, false) of
+                true ->
+                    ok = blocking_sync(Id, Metadata);
+                false ->
+                    ok
+            end,
+            Final;
+        false ->
+            {ok, IsRoot} = case ?DAG_ENABLED of
+                               true ->
+                                   lasp_dependence_dag:is_root(Id);
+                               false ->
+                                   {ok, true}
+                           end,
+            case IsRoot of
+                false ->
+                    {error, {intermediary_not_modification_prohibited, Id}};
+                true ->
+                    Result0 = ?CORE:update(Id, Operation, CRDTActor, ?CLOCK_INCR(Actor),
+                                           ?CLOCK_INIT(Actor), Store),
+                    Final = {ok, {_, _, Metadata, _}} = declare_if_not_found(Result0, Id, State, ?CORE, update,
+                                         [Id, Operation, Actor, ?CLOCK_INCR(Actor), Store]),
+                    case lasp_config:get(blocking_sync, false) of
+                        true ->
+                            ok = blocking_sync(Id, Metadata);
+                        false ->
+                            ok
+                    end,
+                    Final
+            end
+    end,
+    transaction_update(T, CRDTActor, Store, Actor,State,  [Result | Acc]);
+    _ ->
+      transaction_update(T, CRDTActor, Store, Actor,State,  Acc)
+  end.
 
 %% @private
 local_bind(Id, Type, Metadata, Value) ->
