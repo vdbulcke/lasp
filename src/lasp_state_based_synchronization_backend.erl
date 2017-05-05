@@ -66,8 +66,7 @@ extract_log_type_and_payload({state_ack, _From, _Id, {_Id, _Type, _Metadata, Sta
 extract_log_type_and_payload({state_send, _Node, {Id, Type, _Metadata, State}, _AckRequired}) ->
     [{Id, State}, {Type, State}, {state_send, State}, {state_send_protocol, Id}];
 
-%% TODO figure out what this extract_log_type_and_payload does, and what
-%%      should be the output for transaction_send transaction_ack msg
+%% @project adding handler for transaction_ack, transaction_send msg
 extract_log_type_and_payload({transaction_ack, From, Transactions})->
   [{transaction_ack, From, Transactions}];
 
@@ -88,7 +87,6 @@ blocking_sync(ObjectFilterFun) ->
 
 %% @project transaction feature
 %% will enable the transaction feature
-%% TODO need to be exported (part of API)
 enable_transaction() ->
     gen_server:call(?MODULE, {enable_transaction}, infinity).
 
@@ -107,7 +105,7 @@ init([Store, Actor]) ->
     %% Seed the process at initialization.
     ?SYNC_BACKEND:seed(),
 
-    %% TODO disable the schedule_state_synchronization here
+    %% @project  disable the schedule_state_synchronization here
     %% Schedule periodic state synchronization.
     % case lasp_config:get(blocking_sync, false) of
     %     true ->
@@ -385,7 +383,6 @@ handle_info({transaction_sync},
   % updating the list of pending transaction, might be that
   % new nodes arrived
   NewPending = update_pending(PendingTrans, GossipPeers),
-  % TODO @question couldn't it be done with a dict:fold ??
   % get keys, and for each key send complete buffer
   % of pending_transaction
   Keys = dict:fetch_keys(NewPending),
